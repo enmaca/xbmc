@@ -20,7 +20,7 @@
  */
 
 /**
-* @file
+ * @file
  * @brief H.264 / RTP Code (RFC3984)
  * @author Ryan Martell <rdm4@martellventures.com>
  *
@@ -29,66 +29,61 @@
  * This currently supports packetization mode:
  * Single Nal Unit Mode (0), or
  * Non-Interleaved Mode (1).  It currently does not support
- * Interleaved Mode (2). (This requires implementing STAP-B, MTAP16, MTAP24, FU-B packet types)
- *
- * @note TODO:
- * 1) RTCP sender reports for udp streams are required..
- *
+ * Interleaved Mode (2). (This requires implementing STAP-B, MTAP16, MTAP24,
+ *                        FU-B packet types)
  */
 
 #include "libavutil/base64.h"
 #include "libavutil/avstring.h"
 #include "libavcodec/get_bits.h"
 #include "avformat.h"
-#include "mpegts.h"
 
-#include <unistd.h>
 #include "network.h"
 #include <assert.h>
 
 #include "rtpdec.h"
 #include "rtpdec_formats.h"
 
-/**
-    RTP/H264 specific private data.
-*/
 struct PayloadContext {
-    unsigned long cookie;       ///< sanity check, to make sure we get the pointer we're expecting.
-
-    //sdp setup parameters
-    uint8_t profile_idc;        ///< from the sdp setup parameters.
-    uint8_t profile_iop;        ///< from the sdp setup parameters.
-    uint8_t level_idc;          ///< from the sdp setup parameters.
-    int packetization_mode;     ///< from the sdp setup parameters.
+    // sdp setup parameters
+    uint8_t profile_idc;
+    uint8_t profile_iop;
+    uint8_t level_idc;
+    int packetization_mode;
 #ifdef DEBUG
     int packet_types_received[32];
 #endif
 };
 
-#define MAGIC_COOKIE (0xdeadbeef)       ///< Cookie for the extradata; to verify we are what we think we are, and that we haven't been freed.
-#define DEAD_COOKIE (0xdeaddead)        ///< Cookie for the extradata; once it is freed.
+#ifdef DEBUG
+#define COUNT_NAL_TYPE(data, nal) data->packet_types_received[(nal) & 0x1f]++
+#else
+#define COUNT_NAL_TYPE(data, nal) do { } while (0)
+#endif
 
-/* ---------------- private code */
-static int sdp_parse_fmtp_config_h264(AVStream * stream,
-                                      PayloadContext * h264_data,
+static const uint8_t start_sequence[] = { 0, 0, 0, 1 };
+
+static int sdp_parse_fmtp_config_h264(AVStream *stream,
+                                      PayloadContext *h264_data,
                                       char *attr, char *value)
 {
     AVCodecContext *codec = stream->codec;
-    assert(codec->codec_id == CODEC_ID_H264);
+    assert(codec->codec_id == AV_CODEC_ID_H264);
     assert(h264_data != NULL);
 
     if (!strcmp(attr, "packetization-mode")) {
         av_log(codec, AV_LOG_DEBUG, "RTP Packetization Mode: %d\n", atoi(value));
         h264_data->packetization_mode = atoi(value);
         /*
-           Packetization Mode:
-           0 or not present: Single NAL mode (Only nals from 1-23 are allowed)
-           1: Non-interleaved Mode: 1-23, 24 (STAP-A), 28 (FU-A) are allowed.
-           2: Interleaved Mode: 25 (STAP-B), 26 (MTAP16), 27 (MTAP24), 28 (FU-A), and 29 (FU-B) are allowed.
+         * Packetization Mode:
+         * 0 or not present: Single NAL mode (Only nals from 1-23 are allowed)
+         * 1: Non-interleaved Mode: 1-23, 24 (STAP-A), 28 (FU-A) are allowed.
+         * 2: Interleaved Mode: 25 (STAP-B), 26 (MTAP16), 27 (MTAP24), 28 (FU-A),
+         *                      and 29 (FU-B) are allowed.
          */
         if (h264_data->packetization_mode > 1)
             av_log(codec, AV_LOG_ERROR,
-                   "Interleaved RTP mode is not supported yet.");
+                   "Interleaved RTP mode is not supported yet.\n");
     } else if (!strcmp(attr, "profile-level-id")) {
         if (strlen(value) == 6) {
             char buffer[3];
@@ -265,51 +260,54 @@ static int h264_handle_packet(AVFormatContext *ctx,
         av_log(ctx, AV_LOG_ERROR,
                "Unhandled type (%d) (See RFC for implementation details\n",
                type);
-        result= -1;
+        result = AVERROR(ENOSYS);
         break;
 
     case 28:                   // FU-A (fragmented nal)
         buf++;
-        len--;                  // skip the fu_indicator
-        {
-            // these are the same as above, we just redo them here for clarity...
-            uint8_t fu_indicator = nal;
-            uint8_t fu_header = *buf;   // read the fu_header.
-            uint8_t start_bit = fu_header >> 7;
-//            uint8_t end_bit = (fu_header & 0x40) >> 6;
-            uint8_t nal_type = (fu_header & 0x1f);
+        len--;                 // skip the fu_indicator
+        if (len > 1) {
+            // these are the same as above, we just redo them here for clarity
+            uint8_t fu_indicator      = nal;
+            uint8_t fu_header         = *buf;
+            uint8_t start_bit         = fu_header >> 7;
+            uint8_t av_unused end_bit = (fu_header & 0x40) >> 6;
+            uint8_t nal_type          = fu_header & 0x1f;
             uint8_t reconstructed_nal;
 
-            // reconstruct this packet's true nal; only the data follows..
-            reconstructed_nal = fu_indicator & (0xe0);  // the original nal forbidden bit and NRI are stored in this packet's nal;
+            // Reconstruct this packet's true nal; only the data follows.
+            /* The original nal forbidden bit and NRI are stored in this
+             * packet's nal. */
+            reconstructed_nal  = fu_indicator & 0xe0;
             reconstructed_nal |= nal_type;
 
-            // skip the fu_header...
+            // skip the fu_header
             buf++;
             len--;
 
-#ifdef DEBUG
             if (start_bit)
-                data->packet_types_received[nal_type]++;
-#endif
-            if(start_bit) {
-                // copy in the start sequence, and the reconstructed nal....
-                av_new_packet(pkt, sizeof(start_sequence)+sizeof(nal)+len);
+                COUNT_NAL_TYPE(data, nal_type);
+            if (start_bit) {
+                /* copy in the start sequence, and the reconstructed nal */
+                av_new_packet(pkt, sizeof(start_sequence) + sizeof(nal) + len);
                 memcpy(pkt->data, start_sequence, sizeof(start_sequence));
-                pkt->data[sizeof(start_sequence)]= reconstructed_nal;
-                memcpy(pkt->data+sizeof(start_sequence)+sizeof(nal), buf, len);
+                pkt->data[sizeof(start_sequence)] = reconstructed_nal;
+                memcpy(pkt->data + sizeof(start_sequence) + sizeof(nal), buf, len);
             } else {
                 av_new_packet(pkt, len);
                 memcpy(pkt->data, buf, len);
             }
+        } else {
+            av_log(ctx, AV_LOG_ERROR, "Too short data for FU-A H264 RTP packet\n");
+            result = AVERROR_INVALIDDATA;
         }
         break;
 
     case 30:                   // undefined
     case 31:                   // undefined
     default:
-        av_log(ctx, AV_LOG_ERROR, "Undefined type (%d)", type);
-        result= -1;
+        av_log(ctx, AV_LOG_ERROR, "Undefined type (%d)\n", type);
+        result = AVERROR_INVALIDDATA;
         break;
     }
 
@@ -318,18 +316,9 @@ static int h264_handle_packet(AVFormatContext *ctx,
     return result;
 }
 
-/* ---------------- public code */
 static PayloadContext *h264_new_context(void)
 {
-    PayloadContext *data =
-        av_mallocz(sizeof(PayloadContext) +
-                   FF_INPUT_BUFFER_PADDING_SIZE);
-
-    if (data) {
-        data->cookie = MAGIC_COOKIE;
-    }
-
-    return data;
+    return av_mallocz(sizeof(PayloadContext) + FF_INPUT_BUFFER_PADDING_SIZE);
 }
 
 static void h264_free_context(PayloadContext *data)
@@ -344,59 +333,63 @@ static void h264_free_context(PayloadContext *data)
     }
 #endif
 
-    assert(data);
-    assert(data->cookie == MAGIC_COOKIE);
-
-    // avoid stale pointers (assert)
-    data->cookie = DEAD_COOKIE;
-
-    // and clear out this...
     av_free(data);
+}
+
+static int h264_init(AVFormatContext *s, int st_index, PayloadContext *data)
+{
+    if (st_index < 0)
+        return 0;
+    s->streams[st_index]->need_parsing = AVSTREAM_PARSE_FULL;
+    return 0;
 }
 
 static int parse_h264_sdp_line(AVFormatContext *s, int st_index,
                                PayloadContext *h264_data, const char *line)
 {
-    AVStream *stream = s->streams[st_index];
-    AVCodecContext *codec = stream->codec;
+    AVStream *stream;
+    AVCodecContext *codec;
     const char *p = line;
 
-    assert(h264_data->cookie == MAGIC_COOKIE);
+    if (st_index < 0)
+        return 0;
+
+    stream = s->streams[st_index];
+    codec  = stream->codec;
 
     if (av_strstart(p, "framesize:", &p)) {
         char buf1[50];
         char *dst = buf1;
 
-        // remove the protocol identifier..
-        while (*p && *p == ' ') p++; // strip spaces.
-        while (*p && *p != ' ') p++; // eat protocol identifier
-        while (*p && *p == ' ') p++; // strip trailing spaces.
-        while (*p && *p != '-' && (dst - buf1) < sizeof(buf1) - 1) {
+        // remove the protocol identifier
+        while (*p && *p == ' ')
+            p++;                     // strip spaces.
+        while (*p && *p != ' ')
+            p++;                     // eat protocol identifier
+        while (*p && *p == ' ')
+            p++;                     // strip trailing spaces.
+        while (*p && *p != '-' && (dst - buf1) < sizeof(buf1) - 1)
             *dst++ = *p++;
-        }
         *dst = '\0';
 
         // a='framesize:96 320-240'
-        // set our parameters..
-        codec->width = atoi(buf1);
-        codec->height = atoi(p + 1); // skip the -
-        codec->pix_fmt = PIX_FMT_YUV420P;
+        // set our parameters
+        codec->width   = atoi(buf1);
+        codec->height  = atoi(p + 1); // skip the -
     } else if (av_strstart(p, "fmtp:", &p)) {
         return ff_parse_fmtp(stream, h264_data, p, sdp_parse_fmtp_config_h264);
     } else if (av_strstart(p, "cliprect:", &p)) {
         // could use this if we wanted.
     }
 
-    return 0;                   // keep processing it the normal way...
+    return 0;
 }
 
-/**
-This is the structure for expanding on the dynamic rtp protocols (makes everything static. yay!)
-*/
 RTPDynamicProtocolHandler ff_h264_dynamic_handler = {
     .enc_name         = "H264",
     .codec_type       = AVMEDIA_TYPE_VIDEO,
-    .codec_id         = CODEC_ID_H264,
+    .codec_id         = AV_CODEC_ID_H264,
+    .init             = h264_init,
     .parse_sdp_a_line = parse_h264_sdp_line,
     .alloc            = h264_new_context,
     .free             = h264_free_context,
